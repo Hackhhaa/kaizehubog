@@ -55,6 +55,7 @@ local CurrentTheme = "Crimson"
 local EggPriority = {
     ["Giant Egg"] = 1000,
     ["Dragon Egg"] = 990,
+    ["Volcanic Egg"] = 985,
 
     ["Solaris Egg"] = 980,
     ["Cherub Egg"] = 970,
