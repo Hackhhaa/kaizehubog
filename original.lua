@@ -570,6 +570,548 @@ AutoLeaveButton.MouseButton1Click:Connect(function()
 end)
 
 --==================================================
+-- GIVE EGG (drop an egg next to a player so they can pick it up)
+--==================================================
+
+-- Keys tried (in order) to drop the egg you are holding, until it leaves your hands.
+-- Roblox's default drop key is Backspace. Change/add keys here if the game uses another.
+local DROP_KEYS = {
+    Enum.KeyCode.Backspace,
+    Enum.KeyCode.Q,
+    Enum.KeyCode.G,
+}
+
+local SelectedGiveTarget = nil -- username of the chosen player
+local SelectedGiveEgg = nil    -- name of the chosen egg tool
+local GiveBusy = false
+
+-- Eggs we hold / drop for someone else: the auto farm must never treat them as map eggs
+local GivenEggs = setmetatable({}, { __mode = "k" })
+
+local GiveLabel = Instance.new("TextLabel")
+GiveLabel.Size = UDim2.new(1, 0, 0, 25)
+GiveLabel.BackgroundTransparency = 1
+GiveLabel.Text = "GIVE EGG TO PLAYER"
+GiveLabel.TextColor3 = Theme.SubText
+GiveLabel.Font = Enum.Font.GothamBold
+GiveLabel.TextSize = 10
+GiveLabel.TextXAlignment = Enum.TextXAlignment.Left
+GiveLabel.Parent = MiscScroll
+
+-- Username search box (type part of a name to filter the list)
+local GiveBox = Instance.new("TextBox")
+GiveBox.Size = UDim2.new(1, 0, 0, 34)
+GiveBox.BackgroundColor3 = Theme.Card2
+GiveBox.BorderSizePixel = 0
+GiveBox.PlaceholderText = "Type a username..."
+GiveBox.PlaceholderColor3 = Theme.SubText
+GiveBox.Text = ""
+GiveBox.TextColor3 = Theme.Text
+GiveBox.Font = Enum.Font.Gotham
+GiveBox.TextSize = 11
+GiveBox.ClearTextOnFocus = false
+GiveBox.Parent = MiscScroll
+
+do
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 8)
+    corner.Parent = GiveBox
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Theme.Border
+    stroke.Thickness = 1
+    stroke.Parent = GiveBox
+end
+
+-- Player list
+local GiveList = Instance.new("ScrollingFrame")
+GiveList.Size = UDim2.new(1, 0, 0, 112)
+GiveList.BackgroundColor3 = Theme.Card
+GiveList.BorderSizePixel = 0
+GiveList.ScrollBarThickness = 3
+GiveList.CanvasSize = UDim2.new(0, 0, 0, 0)
+GiveList.AutomaticCanvasSize = Enum.AutomaticSize.Y
+GiveList.Parent = MiscScroll
+
+do
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 8)
+    corner.Parent = GiveList
+
+    local pad = Instance.new("UIPadding")
+    pad.PaddingTop = UDim.new(0, 4)
+    pad.PaddingLeft = UDim.new(0, 4)
+    pad.PaddingRight = UDim.new(0, 4)
+    pad.PaddingBottom = UDim.new(0, 4)
+    pad.Parent = GiveList
+
+    local layout = Instance.new("UIListLayout")
+    layout.Padding = UDim.new(0, 4)
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    layout.Parent = GiveList
+end
+
+local GiveEggButton = createButton(
+    MiscScroll,
+    "EGG : tap to choose",
+    UDim2.new(1, 0, 0, 36)
+)
+
+local GiveButton = createButton(
+    MiscScroll,
+    "GIVE EGG",
+    UDim2.new(1, 0, 0, 40)
+)
+
+local GiveStatus = Instance.new("TextLabel")
+GiveStatus.Size = UDim2.new(1, 0, 0, 30)
+GiveStatus.BackgroundTransparency = 1
+GiveStatus.Text = "Pick a player, pick an egg, then press GIVE EGG."
+GiveStatus.TextColor3 = Theme.SubText
+GiveStatus.Font = Enum.Font.Gotham
+GiveStatus.TextSize = 10
+GiveStatus.TextWrapped = true
+GiveStatus.TextXAlignment = Enum.TextXAlignment.Left
+GiveStatus.TextYAlignment = Enum.TextYAlignment.Top
+GiveStatus.Parent = MiscScroll
+
+local function setGiveStatus(text)
+    GiveStatus.Text = text
+end
+
+local function updateGiveButton()
+    if SelectedGiveTarget then
+        GiveButton.Text = "GIVE EGG  ->  " .. SelectedGiveTarget
+    else
+        GiveButton.Text = "GIVE EGG"
+    end
+end
+
+local function getMatchingPlayers()
+
+    local filter = string.lower(GiveBox.Text or "")
+    local list = {}
+
+    for _, plr in ipairs(Players:GetPlayers()) do
+
+        if plr ~= LocalPlayer then
+
+            local name = string.lower(plr.Name)
+            local display = string.lower(plr.DisplayName)
+
+            if filter == ""
+                or string.find(name, filter, 1, true)
+                or string.find(display, filter, 1, true)
+            then
+                table.insert(list, plr)
+            end
+        end
+    end
+
+    table.sort(list, function(a, b)
+        return string.lower(a.Name) < string.lower(b.Name)
+    end)
+
+    return list
+end
+
+local function refreshGivePlayers()
+
+    for _, child in ipairs(GiveList:GetChildren()) do
+        if child:IsA("TextButton") then
+            child:Destroy()
+        end
+    end
+
+    -- Selected player left the server
+    if SelectedGiveTarget and not Players:FindFirstChild(SelectedGiveTarget) then
+        SelectedGiveTarget = nil
+        updateGiveButton()
+    end
+
+    for _, plr in ipairs(getMatchingPlayers()) do
+
+        local label = plr.Name
+
+        if plr.DisplayName ~= plr.Name then
+            label = plr.DisplayName .. "  (@" .. plr.Name .. ")"
+        end
+
+        local row = createButton(GiveList, label, UDim2.new(1, 0, 0, 28))
+        row.TextSize = 10
+        row.TextTruncate = Enum.TextTruncate.AtEnd
+
+        if plr.Name == SelectedGiveTarget then
+            row.BackgroundColor3 = Theme.Accent
+        end
+
+        local plrName = plr.Name
+
+        row.MouseButton1Click:Connect(function()
+            SelectedGiveTarget = plrName
+            updateGiveButton()
+            setGiveStatus("Selected: " .. plrName)
+            refreshGivePlayers()
+        end)
+    end
+end
+
+GiveBox:GetPropertyChangedSignal("Text"):Connect(refreshGivePlayers)
+
+-- Press Enter: if only one player matches what you typed, select them
+GiveBox.FocusLost:Connect(function(enterPressed)
+
+    if not enterPressed then
+        return
+    end
+
+    local matches = getMatchingPlayers()
+
+    if #matches == 1 then
+        SelectedGiveTarget = matches[1].Name
+        updateGiveButton()
+        setGiveStatus("Selected: " .. SelectedGiveTarget)
+        refreshGivePlayers()
+    end
+end)
+
+Players.PlayerAdded:Connect(function()
+    task.defer(refreshGivePlayers)
+end)
+
+Players.PlayerRemoving:Connect(function()
+    task.defer(refreshGivePlayers)
+end)
+
+refreshGivePlayers()
+
+-- The egg you are carrying right now from stealing (not a backpack item)
+local CARRIED_LABEL = "Carried egg (stolen)"
+
+local function getCarriedEgg()
+
+    local char = LocalPlayer.Character
+
+    if not char then
+        return nil
+    end
+
+    for _, item in ipairs(char:GetDescendants()) do
+
+        if not item:IsA("Humanoid")
+            and not item:IsA("Weld")
+            and not item:IsA("WeldConstraint")
+            and not item:IsA("Motor6D")
+            and string.find(string.lower(item.Name), "egg", 1, true)
+        then
+
+            -- climb up to the item that sits directly on the character
+            local top = item
+
+            while top.Parent and top.Parent ~= char do
+                top = top.Parent
+            end
+
+            if top.Parent == char then
+                return top
+            end
+        end
+    end
+
+    return nil
+end
+
+local function describeCharacter()
+
+    local char = LocalPlayer.Character
+    local names = {}
+
+    if char then
+        for _, item in ipairs(char:GetChildren()) do
+            if not item:IsA("BasePart") and not item:IsA("Humanoid") then
+                table.insert(names, item.Name)
+            end
+        end
+    end
+
+    return #names > 0 and table.concat(names, ", ") or "nothing"
+end
+
+-- Eggs you can give (carried stolen egg first, then backpack eggs best -> worst)
+local function getGiveEggs()
+
+    local found = {}
+    local seen = {}
+
+    local function scan(container)
+
+        if not container then
+            return
+        end
+
+        for _, item in ipairs(container:GetChildren()) do
+
+            if item:IsA("Tool")
+                and string.find(string.lower(item.Name), "egg", 1, true)
+                and not seen[item.Name]
+            then
+                seen[item.Name] = true
+                table.insert(found, item.Name)
+            end
+        end
+    end
+
+    scan(LocalPlayer:FindFirstChildOfClass("Backpack"))
+    scan(LocalPlayer.Character)
+
+    table.sort(found, function(a, b)
+
+        local pa = EggPriority[a] or 0
+        local pb = EggPriority[b] or 0
+
+        if pa ~= pb then
+            return pa > pb
+        end
+
+        return a < b
+    end)
+
+    if getCarriedEgg() then
+        table.insert(found, 1, CARRIED_LABEL)
+    end
+
+    return found
+end
+
+local function findEggTool(name)
+
+    local char = LocalPlayer.Character
+    local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+
+    for _, container in ipairs({ char, backpack }) do
+
+        if container then
+            for _, item in ipairs(container:GetChildren()) do
+                if item:IsA("Tool") and item.Name == name then
+                    return item
+                end
+            end
+        end
+    end
+
+    return nil
+end
+
+local function updateEggButton()
+
+    if SelectedGiveEgg then
+        GiveEggButton.Text = "EGG : " .. SelectedGiveEgg
+    else
+        GiveEggButton.Text = "EGG : tap to choose"
+    end
+end
+
+-- Tap to cycle through the eggs you are carrying
+GiveEggButton.MouseButton1Click:Connect(function()
+
+    local eggs = getGiveEggs()
+
+    if #eggs == 0 then
+        SelectedGiveEgg = nil
+        GiveEggButton.Text = "EGG : none in backpack"
+        setGiveStatus("You are not carrying any egg.")
+        return
+    end
+
+    local index = table.find(eggs, SelectedGiveEgg)
+    local nextIndex = index and (index % #eggs) + 1 or 1
+
+    SelectedGiveEgg = eggs[nextIndex]
+
+    GiveEggButton.Text =
+        "EGG : " .. SelectedGiveEgg ..
+        "  (" .. nextIndex .. "/" .. #eggs .. ")"
+end)
+
+local function resolveGiveItem()
+
+    local function byLabel(label)
+
+        if label == CARRIED_LABEL then
+            return getCarriedEgg(), true
+        end
+
+        return findEggTool(label), false
+    end
+
+    if SelectedGiveEgg then
+
+        local item, carried = byLabel(SelectedGiveEgg)
+
+        if item then
+            return item, carried
+        end
+    end
+
+    local eggs = getGiveEggs()
+
+    SelectedGiveEgg = eggs[1]
+    updateEggButton()
+
+    if not SelectedGiveEgg then
+        return nil, false
+    end
+
+    return byLabel(SelectedGiveEgg)
+end
+
+local function isStillHeld(item)
+
+    local char = LocalPlayer.Character
+    local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+
+    if not item or not item.Parent then
+        return false
+    end
+
+    return (char and item:IsDescendantOf(char))
+        or (backpack and item:IsDescendantOf(backpack))
+        or false
+end
+
+local function giveEgg()
+
+    if GiveBusy then
+        return
+    end
+
+    if AutoFarmGlobal then
+        setGiveStatus("Turn AUTO FARM off first.")
+        return
+    end
+
+    local target = SelectedGiveTarget and Players:FindFirstChild(SelectedGiveTarget)
+
+    if not target then
+        setGiveStatus("Pick a player from the list first.")
+        return
+    end
+
+    local item, isCarried = resolveGiveItem()
+
+    if not item then
+        setGiveStatus(
+            "No egg found (backpack or carried). On your character: " ..
+            describeCharacter()
+        )
+        return
+    end
+
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+
+    if not hum or not hrp then
+        setGiveStatus("Your character is not ready.")
+        return
+    end
+
+    local targetHrp = target.Character
+        and target.Character:FindFirstChild("HumanoidRootPart")
+
+    if not targetHrp then
+        setGiveStatus(target.Name .. " has no character yet.")
+        return
+    end
+
+    GiveBusy = true
+    GiveButton.Text = "GIVING..."
+
+    task.spawn(function()
+
+        local startCFrame = hrp.CFrame
+        local eggName = isCarried and item.Name or SelectedGiveEgg
+
+        -- The auto farm must ignore this egg from now on
+        GivenEggs[item] = true
+
+        -- Backpack egg: equip it. A carried (stolen) egg is already in your hands.
+        if not isCarried and item:IsA("Tool") and item.Parent ~= char then
+
+            setGiveStatus("Equipping " .. eggName .. "...")
+
+            pcall(function()
+                hum:EquipTool(item)
+            end)
+
+            task.wait(0.3)
+        end
+
+        -- Go next to the player (in front of them)
+        targetHrp = target.Character
+            and target.Character:FindFirstChild("HumanoidRootPart")
+
+        if not targetHrp then
+            setGiveStatus(target.Name .. " left or respawned. Try again.")
+            GiveBusy = false
+            updateGiveButton()
+            return
+        end
+
+        setGiveStatus("Going to " .. target.Name .. "...")
+
+        hrp.CFrame = targetHrp.CFrame * CFrame.new(0, 0, -4)
+
+        task.wait(0.5)
+
+        -- Try each drop key until the egg leaves your hands
+        local dropped = false
+
+        for _, key in ipairs(DROP_KEYS) do
+
+            VirtualInputManager:SendKeyEvent(true, key, false, game)
+            task.wait(0.1)
+            VirtualInputManager:SendKeyEvent(false, key, false, game)
+
+            task.wait(0.6)
+
+            if not isStillHeld(item) then
+                dropped = true
+                break
+            end
+        end
+
+        if dropped then
+            setGiveStatus(
+                "Dropped " .. eggName .. " next to " .. target.Name ..
+                ". Tell them to pick it up!"
+            )
+        else
+            setGiveStatus(
+                "Could not drop the egg with the keys in DROP_KEYS. " ..
+                "On your character: " .. describeCharacter()
+            )
+        end
+
+        -- Stay a moment so they can grab it, then go back
+        task.wait(1.5)
+
+        local currentChar = LocalPlayer.Character
+        local currentHrp = currentChar
+            and currentChar:FindFirstChild("HumanoidRootPart")
+
+        if currentHrp then
+            currentHrp.CFrame = startCFrame
+        end
+
+        GiveBusy = false
+        updateGiveButton()
+    end)
+end
+
+GiveButton.MouseButton1Click:Connect(giveEgg)
+
+--==================================================
 -- GUI SMALLER
 --==================================================
 
@@ -712,11 +1254,21 @@ local function applyTheme(themeName)
         TeleportBackButton,
         AntiAFKButton,
         AutoLeaveButton,
-        SmallerButton
+        SmallerButton,
+        GiveEggButton,
+        GiveButton
     }) do
         button.BackgroundColor3 = Theme.Card2
         button.TextColor3 = Theme.Text
     end
+
+    GiveLabel.TextColor3 = Theme.SubText
+    GiveStatus.TextColor3 = Theme.SubText
+    GiveBox.BackgroundColor3 = Theme.Card2
+    GiveBox.TextColor3 = Theme.Text
+    GiveBox.PlaceholderColor3 = Theme.SubText
+    GiveList.BackgroundColor3 = Theme.Card
+    refreshGivePlayers()
 
     for _, obj in ipairs(ScreenGui:GetDescendants()) do
 
@@ -873,6 +1425,17 @@ end
 local function isEggObject(obj)
 
     if not obj then
+        return false
+    end
+
+    -- Ignore eggs we are giving to another player
+    if GivenEggs[obj] then
+        return false
+    end
+
+    local ownerTool = obj:FindFirstAncestorOfClass("Tool")
+
+    if ownerTool and GivenEggs[ownerTool] then
         return false
     end
 
@@ -1106,7 +1669,7 @@ function processQueue()
                     and not isInsideGarden(egg)
                 do
 
-                    attempts += 1
+                    attempts = attempts + 1
 
                     local character = LocalPlayer.Character
                     local hrp = character
