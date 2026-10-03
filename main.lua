@@ -1,5 +1,5 @@
--- VIPKING 2.1 | Ride a Pet egg collector
--- Client-side replacement for vipking.lua. No downloaded code or guessed remotes.
+-- KAIZE HUB 3.1 | Ride a Pet egg collector
+-- Client-side KAIZE HUB update. No downloaded code or guessed remotes.
 -- RightControl: show/hide. F6: stop all actions. Use X to unload completely.
 -- First migration from the old script: rejoin once to remove its unmanaged loops.
 -- Live-game compatibility is not guaranteed: server validation still applies.
@@ -7,10 +7,11 @@
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
 local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
 local LocalPlayer = Players.LocalPlayer
-assert(LocalPlayer, "VIPKING must run on the client")
+assert(LocalPlayer, "KAIZE HUB must run on the client")
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui", 10)
-assert(PlayerGui, "VIPKING: PlayerGui was not ready; try again")
+assert(PlayerGui, "KAIZE HUB: PlayerGui was not ready; try again")
 
 local Config = {
     ScanInterval = 15, -- recovery scan; normal discovery uses instance events
@@ -23,13 +24,13 @@ local Config = {
     HomeSettle = 0.3, -- brief delivery/replication window, then continue farming
     MaxESP = 80,
     MaxHighlights = 24,
-    MaxVolcanoAreas = 8,
-    VolcanoCFrame = nil, -- optional exact destination for your map
+    FlyMin = 50,
+    FlyMax = 5000,
     ExtraAdminUserIds = {},
     AdminMinGroupRank = 200,
     -- Exact ancestor words; "Baseplate" and "Database" are not gardens.
     GardenWords = {garden = true, gardens = true, plot = true, plots = true,
-        farm = true, farms = true, base = true, bases = true},
+        farm = true, farms = true, base = true, bases = true, ranch = true, ranches = true, home = true, homes = true},
 }
 
 local EggPriority = {
@@ -72,21 +73,28 @@ end
 function Rules.autoAllowed(mode, selected, name)
     return mode == "All" or selected[name] == true
 end
-function Rules.volcanoName(name)
-    local lower = string.lower(name)
-    return string.find(lower, "volcano", 1, true) ~= nil or string.find(lower, "volcanic", 1, true) ~= nil
+function Rules.flySpeed(value)
+    local number = tonumber(value)
+    if not number or number ~= number or number == math.huge or number == -math.huge then return nil end
+    return math.clamp(math.floor(number + 0.5), Config.FlyMin, Config.FlyMax)
 end
-function Rules.travelMarker(name)
-    local lower = string.lower(name)
-    for _, word in ipairs({"spawn", "arrival", "entrance", "entry", "teleport", "portal", "checkpoint"}) do
-        if string.find(lower, word, 1, true) then return true end
-    end
-    return string.match(lower, "^tp") ~= nil or string.match(lower, "tp$") ~= nil
+function Rules.flightVelocity(look, right, forward, sideways, vertical, speed)
+    local direction = look * forward + right * sideways + Vector3.new(0, vertical, 0)
+    if direction.Magnitude > 1 then direction = direction.Unit end
+    return direction * speed
 end
-function Rules.hazardName(name)
-    local lower = string.lower(name)
-    for _, word in ipairs({"lava", "kill", "damage", "acid", "death"}) do
-        if string.find(lower, word, 1, true) then return true end
+function Rules.normalName(value)
+    return string.lower(tostring(value)):gsub("[^%w]", "")
+end
+function Rules.baseGroup(name)
+    local groups = {ranches = true, bases = true, plots = true, homes = true, gardens = true, farms = true}
+    return groups[Rules.normalName(name)] == true
+end
+function Rules.baseName(name)
+    if Rules.baseGroup(name) then return false end
+    local split = string.gsub(name, "(%l)(%u)", "%1 %2")
+    for word in string.gmatch(string.lower(split), "%a+") do
+        if word == "ranch" or word == "base" or word == "plot" or word == "home" or word == "garden" then return true end
     end
     return false
 end
@@ -99,16 +107,24 @@ local App = {
     auto = false, selected = {}, sort = "Priority", mode = "All",
     speed = "Balanced", autoReturn = true, stowEggTools = true,
     antiAFK = false, autoLeave = false, theme = "Galaxy", language = "en",
-    uiScale = 1, home = nil, homeCharacter = nil, tab = "Collect",
+    uiScale = 1, baseProof = nil, baseCandidates = {}, baseLabels = {}, baseLastTry = -math.huge,
+    baseStatus = "Base: checking assigned ranch", tab = "Collect",
     minimized = false, picked = 0, unverified = 0, failures = 0,
     started = os.clock(), status = "Ready", logs = {}, ui = {}, dirty = true,
     search = "", espEnabled = false, espSelectedOnly = false, espRows = {}, espCount = 0,
-    volcanoSaved = nil, volcanoInfo = "Auto-detect from loaded map, or save your position at the volcano.",
+    flyEnabled = false, flySpeed = 100, flight = nil, flightKeys = {}, flightTouches = {},
+    noclipEnabled = false, noclipCharacter = nil, collisionOriginal = {}, windowFocused = true,
 }
 local Profiles = {
     Fast = {settle = 0.05, grace = 0.55, gap = 0.05},
     Balanced = {settle = 0.12, grace = 1.0, gap = 0.12},
     Reliable = {settle = 0.25, grace = 1.8, gap = 0.25},
+}
+local FlyKeyActions = {
+    [Enum.KeyCode.W] = "forward", [Enum.KeyCode.S] = "back",
+    [Enum.KeyCode.A] = "left", [Enum.KeyCode.D] = "right",
+    [Enum.KeyCode.Space] = "up", [Enum.KeyCode.E] = "up",
+    [Enum.KeyCode.Q] = "down", [Enum.KeyCode.LeftControl] = "down",
 }
 local Compat = {firePrompt = type(fireproximityprompt) == "function" and fireproximityprompt or nil}
 pcall(function() Compat.virtualUser = game:GetService("VirtualUser") end)
@@ -164,6 +180,8 @@ end
 function App:stop(message)
     self.auto = false
     self:cancel(message or "Stopped")
+    self:disableFly()
+    self:setNoclip(false)
 end
 function App:unload()
     if not self.alive then return end
@@ -177,9 +195,9 @@ function App:unload()
     if self.gui then self.gui:Destroy() end
 end
 
--- Cooperative singleton: a new v2 run fully unloads an older v2 session.
-do
-    local previous = PlayerGui:FindFirstChild("VIPKING_V2")
+-- Unload both the previous KAIZE session and older VIPKING versions.
+for _, oldName in ipairs({"KAIZE_HUB_V3", "VIPKING_V2"}) do
+    local previous = PlayerGui:FindFirstChild(oldName)
     if previous then
         local shutdown = previous:FindFirstChild("Shutdown")
         if shutdown and shutdown:IsA("BindableFunction") then pcall(function() shutdown:Invoke() end) end
@@ -249,6 +267,11 @@ function App:eligible(obj)
     return self:position(obj) ~= nil
 end
 function App:track(obj)
+    if obj:IsA("TextLabel") then self.baseLabels[obj] = true end
+    if (obj:IsA("Model") or obj:IsA("Folder")) and not Rules.baseGroup(obj.Name)
+        and (Rules.baseName(obj.Name) or (obj.Parent and Rules.baseGroup(obj.Parent.Name))) then
+        self.baseCandidates[obj] = true
+    end
     if not self.candidates[obj] and (obj:IsA("Model") or obj:IsA("BasePart")) and Rules.eggName(obj.Name) then
         self.nextId = self.nextId + 1
         self.candidates[obj] = self.nextId
@@ -260,6 +283,11 @@ function App:scan()
         if not obj:IsDescendantOf(Workspace) then self.candidates[obj] = nil end
     end
     for _, obj in ipairs(Workspace:GetDescendants()) do self:track(obj) end
+    for _, obj in ipairs(PlayerGui:GetDescendants()) do
+        if obj:IsA("TextLabel") and not obj:IsDescendantOf(self.gui) then self.baseLabels[obj] = true end
+    end
+    for obj in pairs(self.baseCandidates) do if not obj:IsDescendantOf(Workspace) then self.baseCandidates[obj] = nil end end
+    for obj in pairs(self.baseLabels) do if not obj.Parent then self.baseLabels[obj] = nil end end
     self.dirty = true
 end
 function App:listEggs()
@@ -295,16 +323,194 @@ function App:move(root, cf)
     root.AssemblyAngularVelocity = Vector3.zero
     return true
 end
-function App:saveHome()
-    local char, root = self:character()
-    if not root then self:log("Wait for your character to spawn"); return end
-    if self.active then self:log("Stop the current action before saving home"); return end
-    self.home, self.homeCharacter = root.CFrame, char
-    self:log("Return point saved")
+-- Base resolution keeps live object references, never the player's CFrame.
+local OwnerFields = {owner = true, ownerid = true, owneruserid = true, ownername = true,
+    player = true, playerid = true, playeruserid = true, claimedby = true, plotowner = true, ranchowner = true}
+local AssignmentFields = {base = true, baseid = true, basename = true, ranch = true, ranchid = true,
+    ranchname = true, plot = true, plotid = true, plotname = true, home = true, assignedbase = true, assignedranch = true}
+function App:matchesPlayer(value)
+    if typeof(value) == "Instance" then return value == LocalPlayer end
+    if type(value) == "number" then return value == LocalPlayer.UserId end
+    if type(value) ~= "string" then return false end
+    return value == tostring(LocalPlayer.UserId) or string.lower(value) == string.lower(LocalPlayer.Name)
 end
+function App:ownerState(obj)
+    local matched, conflict = false, false
+    local function consider(value)
+        if value ~= nil and value ~= "" then
+            if self:matchesPlayer(value) then matched = true else conflict = true end
+        end
+    end
+    for key, value in pairs(obj:GetAttributes()) do if OwnerFields[Rules.normalName(key)] then consider(value) end end
+    for _, child in ipairs(obj:GetChildren()) do
+        if OwnerFields[Rules.normalName(child.Name)] and child:IsA("ValueBase") then consider(child.Value) end
+    end
+    return matched, conflict
+end
+function App:baseObjectAllowed(obj)
+    if not obj or not obj:IsDescendantOf(Workspace) then return false end
+    local node = obj
+    while node and node ~= Workspace do
+        if node:IsA("Tool") or node:IsA("Accessory") or Rules.eggName(node.Name) then return false end
+        if node:IsA("Model") and (Players:GetPlayerFromCharacter(node) or node:FindFirstChildOfClass("Humanoid")) then return false end
+        node = node.Parent
+    end
+    return true
+end
+function App:baseContainer(obj)
+    if not self:baseObjectAllowed(obj) then return nil end
+    local best, node = nil, obj
+    while node and node ~= Workspace do
+        if (node:IsA("Model") or node:IsA("Folder")) and not Rules.baseGroup(node.Name) then
+            if node.Parent and Rules.baseGroup(node.Parent.Name) then return node end
+            if Rules.baseName(node.Name) then best = node end
+        end
+        node = node.Parent
+    end
+    return best
+end
+function App:labelBase(label)
+    if not label.Parent or not label.Visible then return nil end
+    local text = Rules.normalName((label.Text:gsub("<[^>]+>", "")))
+    if text ~= "yourranch" and text ~= "yourbase" and text ~= "yourhome" and text ~= "yourplot" then return nil end
+    local node = label.Parent
+    while node and node ~= Workspace and node ~= PlayerGui do
+        if node:IsA("BillboardGui") or node:IsA("SurfaceGui") then
+            if not node.Enabled then return nil end
+            return self:baseContainer(node.Adornee or node.Parent)
+        end
+        node = node.Parent
+    end
+    return nil
+end
+function App:assignmentValue(proof)
+    if proof.attribute then return proof.source:GetAttribute(proof.attribute) end
+    return proof.source.Parent and proof.source.Value or nil
+end
+function App:assignmentMatches(root, value)
+    if typeof(value) == "Instance" then return value == root or value:IsDescendantOf(root) end
+    if type(value) ~= "number" and type(value) ~= "string" then return false end
+    if tostring(value) == root.Name then return true end
+    for _, key in ipairs({"BaseId", "RanchId", "PlotId", "Id", "ID"}) do
+        local id = root:GetAttribute(key)
+        if id ~= nil and tostring(id) == tostring(value) then return true end
+    end
+    return false
+end
+function App:baseProofValid(proof)
+    if not proof or not self:baseObjectAllowed(proof.root) then return false end
+    local own, conflict = self:ownerState(proof.root)
+    if conflict then return false end
+    if proof.kind == "owner" then return own end
+    if proof.kind == "assigned" then return self:assignmentMatches(proof.root, self:assignmentValue(proof)) end
+    if proof.kind == "label" then return self:labelBase(proof.source) == proof.root end
+    if proof.kind == "name" then
+        return proof.root.Parent and Rules.baseGroup(proof.root.Parent.Name)
+            and (proof.root.Name == tostring(LocalPlayer.UserId) or string.lower(proof.root.Name) == string.lower(LocalPlayer.Name))
+    end
+    return false
+end
+function App:findAssignedBase()
+    if self:baseProofValid(self.baseProof) then return self.baseProof.root end
+    self.baseProof = nil
+    if os.clock() - self.baseLastTry < 2 then return nil end
+    self.baseLastTry = os.clock()
+    local matches, bestRank = {}, 0
+    local function offer(proof, rank)
+        if not self:baseProofValid(proof) then return end
+        if rank > bestRank then matches = {}; bestRank = rank end
+        if rank == bestRank then matches[proof.root] = proof end
+    end
+    local function assignment(source, attribute, value)
+        if typeof(value) == "Instance" and self:baseObjectAllowed(value) then
+            local root = self:baseContainer(value) or value
+            if not Rules.baseGroup(root.Name) and (root:IsA("Model") or root:IsA("Folder") or root:IsA("BasePart")) then
+                offer({root = root, kind = "assigned", source = source, attribute = attribute}, 3)
+            end
+        else
+            for root in pairs(self.baseCandidates) do
+                if self:assignmentMatches(root, value) then offer({root = root, kind = "assigned", source = source, attribute = attribute}, 3) end
+            end
+        end
+    end
+    for key, value in pairs(LocalPlayer:GetAttributes()) do
+        if AssignmentFields[Rules.normalName(key)] then assignment(LocalPlayer, key, value) end
+    end
+    for _, child in ipairs(LocalPlayer:GetChildren()) do
+        if AssignmentFields[Rules.normalName(child.Name)] and child:IsA("ValueBase") then assignment(child, nil, child.Value) end
+    end
+    for root in pairs(self.baseCandidates) do
+        offer({root = root, kind = "owner"}, 2)
+        offer({root = root, kind = "name"}, 1)
+    end
+    for label in pairs(self.baseLabels) do
+        local root = self:labelBase(label)
+        if root then offer({root = root, kind = "label", source = label}, 1) end
+    end
+    local result
+    for root, proof in pairs(matches) do
+        if result and result.root ~= root then
+            self.baseStatus = "Base: multiple assignments found; ownership is ambiguous"
+            return nil
+        end
+        result = proof
+    end
+    self.baseProof = result
+    if result then self.baseStatus = "Base: " .. result.root:GetFullName() .. " (" .. result.kind .. ")"; return result.root end
+    self.baseStatus = "Base not detected: assigned ranch/ownership data is not available"
+    return nil
+end
+function App:baseDestination()
+    local base = self:findAssignedBase()
+    if not base then return nil end
+    local priorities = {returnpoint = 100, homespawn = 100, playerspawn = 100, spawnpoint = 95,
+        spawn = 90, depositzone = 85, deliveryzone = 85, dropoff = 85, entrance = 70,
+        floor = 50, baseplate = 50, ground = 50, platform = 45}
+    local parts = base:GetDescendants()
+    if base:IsA("BasePart") then table.insert(parts, base) end
+    local candidates = {}
+    for _, part in ipairs(parts) do
+        if part:IsA("BasePart") and part.Anchored and self:baseObjectAllowed(part) then
+            local rank = priorities[Rules.normalName(part.Name)] or 0
+            if part == LocalPlayer.RespawnLocation then rank = 110 end
+            if part.CanCollide and part.Size.X >= 4 and part.Size.Z >= 4 and part.Size.Y <= math.max(part.Size.X, part.Size.Z) / 2
+                and part.CFrame.UpVector.Y > 0.7 then
+                -- A live flat structural part inside the identified base, not its model pivot.
+                if rank == 0 then rank = 10 end
+                table.insert(candidates, {part = part, rank = rank})
+            elseif rank >= 70 then
+                -- Trigger/spawn markers may be non-colliding; ground must still belong to this base.
+                table.insert(candidates, {part = part, rank = rank, needsGround = true})
+            end
+        end
+    end
+    table.sort(candidates, function(a, b)
+        if a.rank ~= b.rank then return a.rank > b.rank end
+        return a.part:GetFullName() < b.part:GetFullName()
+    end)
+    for _, item in ipairs(candidates) do
+        if not item.needsGround then
+            local part = item.part
+            return CFrame.new(part.Position + Vector3.new(0, part.Size.Y / 2 + 3.5, 0))
+        end
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Include
+        params.FilterDescendantsInstances = {base}
+        params.RespectCanCollide = true
+        local hit = Workspace:Raycast(item.part.Position + Vector3.new(0, 8, 0), Vector3.new(0, -150, 0), params)
+        if hit and hit.Normal.Y > 0.7 and self:baseObjectAllowed(hit.Instance)
+            and (hit.Instance == base or hit.Instance:IsDescendantOf(base)) then
+            return CFrame.new(hit.Position + Vector3.new(0, 3.5, 0))
+        end
+    end
+    self.baseStatus = "Base found, but no usable spawn/floor is loaded: " .. base.Name
+    return nil
+end
+
 function App:queueJob(job)
     if not self.alive then return end
-    if job.kind ~= "pickup" and job.kind ~= "home" and job.kind ~= "volcano" then return end
+    if job.kind ~= "pickup" and job.kind ~= "home" then return end
+    self:disableFly()
     if #self.queue >= Config.MaxManualQueue then self:log("Queue is full"); return end
     if job.egg and (self.queued[job.egg] or (self.active and self.active.egg == job.egg)) then return end
     if job.egg then self.queued[job.egg] = true end
@@ -434,132 +640,183 @@ function App:returnSettle(token, char, humanoid)
     -- Non-Tool carried models are left alone; the scheduler still continues.
 end
 
-function App:worldObjectAllowed(obj)
-    local node = obj
-    while node and node ~= Workspace do
-        if node:IsA("Tool") or node:IsA("Accessory") or string.find(string.lower(node.Name), "egg", 1, true) then return false end
-        if node:IsA("Model") and (Players:GetPlayerFromCharacter(node) or node:FindFirstChildOfClass("Humanoid")) then return false end
-        node = node.Parent
+function App:clearFlightInput()
+    self.flightKeys, self.flightTouches = {}, {}
+    if self.flight and self.flight.velocity then
+        pcall(function() self.flight.velocity.VectorVelocity = Vector3.zero end)
     end
-    return node == Workspace
 end
-function App:isHazard(obj)
-    local node = obj
-    while node and node ~= Workspace do
-        if Rules.hazardName(node.Name) then return true end
-        node = node.Parent
-    end
-    return false
-end
-function App:volcanoObjects()
-    local markers, areas = {}, {}
-    for _, obj in ipairs(Workspace:GetDescendants()) do
-        if (obj:IsA("Model") or obj:IsA("BasePart")) and self:worldObjectAllowed(obj) then
-            local hasVolcano, node = false, obj
-            while node and node ~= Workspace do
-                if Rules.volcanoName(node.Name) then hasVolcano = true; break end
-                node = node.Parent
-            end
-            if hasVolcano and obj:IsA("BasePart") and obj.Anchored and not self:isHazard(obj)
-                and Rules.travelMarker(obj.Name) then
-                table.insert(markers, obj)
-            elseif Rules.volcanoName(obj.Name) and self:position(obj) then
-                table.insert(areas, obj)
-            end
+function App:disableFly()
+    local flight = self.flight
+    self.flight = nil
+    self.flyEnabled = false
+    self:clearFlightInput()
+    if self.ui.flightPad then self.ui.flightPad.Visible = false end
+    if flight then
+        for _, key in ipairs({"velocity", "orientation", "attachment"}) do
+            if flight[key] then pcall(function() flight[key]:Destroy() end) end
         end
+        pcall(function()
+            flight.humanoid.AutoRotate = flight.autoRotate
+            flight.humanoid.PlatformStand = flight.platformStand
+            if not flight.platformStand and flight.humanoid.Health > 0 and LocalPlayer.Character == flight.character then
+                flight.humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
+            end
+        end)
+        pcall(function()
+            flight.root.AssemblyLinearVelocity = Vector3.zero
+            flight.root.AssemblyAngularVelocity = Vector3.zero
+        end)
     end
-    -- Stable ordering; marker search is restricted to volcano-related objects.
-    local function order(a, b) return a:GetFullName() < b:GetFullName() end
-    table.sort(markers, order); table.sort(areas, order)
-    return markers, areas
+    self.dirty = true
 end
-function App:groundAt(position, height, depth)
-    local params = RaycastParams.new()
-    params.FilterType = Enum.RaycastFilterType.Exclude
-    params.FilterDescendantsInstances = LocalPlayer.Character and {LocalPlayer.Character} or {}
-    params.RespectCanCollide = true
-    params.IgnoreWater = false
-    local hit = Workspace:Raycast(position + Vector3.new(0, height, 0), Vector3.new(0, -depth, 0), params)
-    if not hit or hit.Normal.Y < 0.7 or hit.Material == Enum.Material.Water then return nil end
-    if not self:worldObjectAllowed(hit.Instance) or self:isHazard(hit.Instance) then return nil end
-    if hit.Instance:IsA("BasePart") and (not hit.Instance.Anchored or not hit.Instance.CanCollide) then return nil end
-    return CFrame.new(hit.Position + Vector3.new(0, 3.5, 0))
+function App:enableFly()
+    if self.flyEnabled then return end
+    local char, root, humanoid = self:character()
+    if not root then self:log("Wait for your character to spawn"); return end
+    if root.Anchored or humanoid.Sit then self:log("Stand up/dismount before enabling Fly"); return end
+    self.auto = false
+    self:cancel()
+    self:clearFlightInput()
+    local flight = {character = char, root = root, humanoid = humanoid,
+        autoRotate = humanoid.AutoRotate, platformStand = humanoid.PlatformStand}
+    self.flight = flight
+    local ok, err = pcall(function()
+        flight.attachment = self:node("Attachment", root, {Name = "KaizeFlightAttachment"})
+        flight.velocity = self:node("LinearVelocity", root, {Name = "KaizeFlightVelocity",
+            Attachment0 = flight.attachment, RelativeTo = Enum.ActuatorRelativeTo.World,
+            VelocityConstraintMode = Enum.VelocityConstraintMode.Vector, ForceLimitsEnabled = false,
+            VectorVelocity = Vector3.zero})
+        flight.orientation = self:node("AlignOrientation", root, {Name = "KaizeFlightOrientation",
+            Attachment0 = flight.attachment, Mode = Enum.OrientationAlignmentMode.OneAttachment,
+            MaxTorque = 1000000000, MaxAngularVelocity = 100, Responsiveness = 25,
+            CFrame = root.CFrame})
+        humanoid.AutoRotate = false
+        humanoid.PlatformStand = true
+    end)
+    if not ok then self:disableFly(); self:log("Fly unavailable: " .. tostring(err)); return end
+    self.flyEnabled = true
+    if self.ui.flightPad then self.ui.flightPad.Visible = true end
+    self:log("Fly ON at " .. self.flySpeed .. " studs/s. Auto farm stopped.")
 end
-function App:resolveVolcano(root)
-    if self.volcanoSaved then return self.volcanoSaved, "saved position" end
-    if Config.VolcanoCFrame then return Config.VolcanoCFrame, "configured position" end
-    local markers, areas = self:volcanoObjects()
-    for _, marker in ipairs(markers) do
-        local destination = self:groundAt(marker.Position, math.max(marker.Size.Y / 2 + 8, 12), 400)
-        if destination then return destination, marker:GetFullName() end
+function App:setFlySpeed(value)
+    local speed = Rules.flySpeed(value)
+    if not speed then
+        if self.ui.flySpeedBox then self.ui.flySpeedBox.Text = tostring(self.flySpeed) end
+        self:log("Enter a number from 50 to 5000 for Fly speed")
+        return false
     end
-    -- A model pivot can be in the crater: sample ground outside its footprint.
-    local best, bestDistance, source
-    for areaIndex, area in ipairs(areas) do
-        if areaIndex > Config.MaxVolcanoAreas then break end
-        local box, size
-        if area:IsA("Model") then box, size = area:GetBoundingBox()
-        else box, size = area.CFrame, area.Size end
-        local radius = math.sqrt(size.X * size.X + size.Z * size.Z) / 2 + 14
-        for i = 0, 7 do
-            local angle = i * math.pi / 4
-            local probe = box.Position + Vector3.new(math.cos(angle) * radius, 0, math.sin(angle) * radius)
-            local destination = self:groundAt(probe, size.Y / 2 + 100, size.Y + 600)
-            if destination then
-                local distance = (destination.Position - root.Position).Magnitude
-                if not bestDistance or distance < bestDistance then
-                    best, bestDistance, source = destination, distance, area:GetFullName() .. " (edge)"
+    self.flySpeed = speed
+    if self.ui.flySpeedBox then self.ui.flySpeedBox.Text = tostring(speed) end
+    self.dirty = true
+    return true
+end
+function App:rememberCollision(part)
+    if not part:IsA("BasePart") then return end
+    if self.collisionOriginal[part] == nil then self.collisionOriginal[part] = part.CanCollide end
+    part.CanCollide = false
+end
+function App:setNoclip(enabled)
+    if not enabled then
+        self.noclipEnabled = false
+        if self.noclipAdded then self.noclipAdded:Disconnect(); self.noclipAdded = nil end
+        for part, value in pairs(self.collisionOriginal) do pcall(function() part.CanCollide = value end) end
+        self.collisionOriginal = {}
+        self.noclipCharacter = nil
+        self.dirty = true
+        return
+    end
+    if self.noclipEnabled then return end
+    local char = self:character()
+    if not char then self:log("Wait for your character to spawn"); return end
+    self.noclipCharacter = char
+    self.noclipEnabled = true
+    local ok, err = pcall(function()
+        for _, part in ipairs(char:GetDescendants()) do self:rememberCollision(part) end
+        self.noclipAdded = char.DescendantAdded:Connect(function(part)
+            if self.alive and self.noclipEnabled and self.noclipCharacter == char then
+                local tracked, trackError = pcall(function() self:rememberCollision(part) end)
+                if not tracked then self:setNoclip(false); self:log("No Clip stopped: " .. tostring(trackError)) end
+            end
+        end)
+    end)
+    if not ok then self:setNoclip(false); self:log("No Clip unavailable: " .. tostring(err)); return end
+    self:log("No Clip ON")
+end
+function App:updateMovement()
+    local char, root = self:character()
+    if self.noclipEnabled then
+        if not char or char ~= self.noclipCharacter then self:setNoclip(false)
+        else
+            for part, original in pairs(self.collisionOriginal) do
+                if part:IsDescendantOf(char) then part.CanCollide = false
+                else
+                    pcall(function() part.CanCollide = original end)
+                    self.collisionOriginal[part] = nil
                 end
             end
         end
-        if best then break end
     end
-    return best, source
-end
-function App:teleportVolcano(token, char, root)
-    local destination, source = self:resolveVolcano(root)
-    if not self:valid(token, char) then return end
-    if not destination then
-        self.volcanoInfo = "No usable volcano point found. Visit the volcano and press Save volcano point."
-        self:log(self.volcanoInfo)
+    local flight = self.flight
+    if not self.flyEnabled or not flight then return end
+    if char ~= flight.character or root ~= flight.root or root.Anchored
+        or not flight.velocity.Parent or not flight.orientation.Parent or not flight.attachment.Parent then
+        self:disableFly(); self:log("Fly stopped: character changed or cannot move"); return
+    end
+    local camera = Workspace.CurrentCamera
+    if not camera or not self.windowFocused or UserInputService:GetFocusedTextBox() then
+        self:clearFlightInput()
+        flight.velocity.VectorVelocity = Vector3.zero
         return
     end
-    if self:move(root, destination) then
-        self.volcanoInfo = "Destination: " .. source
-        self:log("Teleported to volcano: " .. source .. ". Auto farm is stopped.")
-    else self:log("Volcano teleport could not move the character") end
-end
-function App:saveVolcano()
-    local _, root = self:character()
-    if not root then self:log("Wait for your character to spawn"); return end
-    if self.auto or self.active or #self.queue > 0 then self:log("Stop collection before saving the volcano point"); return end
-    self.volcanoSaved = root.CFrame
-    self.volcanoInfo = "Saved volcano point for this session."
-    self:log(self.volcanoInfo)
+    local actions = {}
+    for _, action in pairs(self.flightKeys) do actions[action] = true end
+    for _, action in pairs(self.flightTouches) do actions[action] = true end
+    local forward = (actions.forward and 1 or 0) - (actions.back and 1 or 0)
+    local sideways = (actions.right and 1 or 0) - (actions.left and 1 or 0)
+    local vertical = (actions.up and 1 or 0) - (actions.down and 1 or 0)
+    flight.velocity.VectorVelocity = Rules.flightVelocity(camera.CFrame.LookVector, camera.CFrame.RightVector,
+        forward, sideways, vertical, self.flySpeed)
+    local look = camera.CFrame.LookVector
+    local flat = Vector3.new(look.X, 0, look.Z)
+    if flat.Magnitude > 0.01 then flight.orientation.CFrame = CFrame.lookAt(Vector3.zero, flat.Unit) end
+    flight.humanoid.AutoRotate = false
+    flight.humanoid.PlatformStand = true
 end
 
 function App:runJob(job)
     local char, root, humanoid = self:character()
     if not root then self:log("Waiting for character"); return end
     if root.Anchored or humanoid.Sit then self:log("Stand up and wait until your character can move"); return end
-    local token, start = self.epoch, root.CFrame
-    local destination = self.homeCharacter == char and self.home or start
+    local token = self.epoch
+    if job.kind == "home" or (job.kind == "pickup" and self.autoReturn) then
+        local destination = self:baseDestination()
+        if not destination then
+            self.auto = false
+            self:cancel(self.baseStatus .. "; collection stopped")
+            return
+        end
+    end
     self.active = job
     local ok, err = xpcall(function()
         if job.kind == "pickup" then self:pickup(job, token, char, root)
-        elseif job.kind == "volcano" then self:teleportVolcano(token, char, root)
         elseif job.kind == "home" then
-            if self.home and self.homeCharacter == char then self:move(root, self.home); self:log("Returned home")
-            else self:log("Save a return point first") end
+            local destination = self:baseDestination()
+            if destination then self:move(root, destination); self:log("Returned to assigned base")
+            else self:log(self.baseStatus) end
         end
     end, function(message) return tostring(message) end)
     self:releaseInput() -- finally: always release input and restore prompt properties
     if self:valid(token, char) and job.kind == "pickup" and self.autoReturn then
-        local returned, moved = pcall(function() return self:move(root, destination) end)
+        local returned, moved = pcall(function()
+            local destination = self:baseDestination()
+            if not destination then self.auto = false; self.queue = {}; self.queued = {}; return false end
+            return self:move(root, destination)
+        end)
         if returned and moved then
             local settled, settleError = pcall(function() self:returnSettle(token, char, humanoid) end)
             if not settled and self.alive then self:log("Home cleanup skipped: " .. tostring(settleError)) end
-        elseif self.alive then self:log("Return failed; collection remains enabled") end
+        elseif self.alive then self.auto = false; self.queue = {}; self.queued = {}; self:log(self.baseStatus .. "; return failed, collection stopped") end
     end
     self.active = nil
     self.dirty = true
@@ -582,21 +839,20 @@ local Khmer = {
     Collect = "ប្រមូល", World = "ផែនទី", Settings = "ការកំណត់", Activity = "សកម្មភាព",
     Available = "ពងមាន", Confirmed = "បានយក", Queue = "ជួរ", Session = "រយៈពេល",
     ["START AUTO"] = "ចាប់ផ្តើមស្វ័យប្រវត្តិ", ["STOP AUTO"] = "បញ្ឈប់ស្វ័យប្រវត្តិ",
-    ["Pick next"] = "យកពងបន្ទាប់", ["Save home"] = "រក្សាទីតាំង", ["Go home"] = "ត្រឡប់ទីតាំង",
+    ["Pick next"] = "យកពងបន្ទាប់", ["Go base"] = "ត្រឡប់ទៅមូលដ្ឋាន",
     ["Search eggs..."] = "ស្វែងរកពង...",
     ["No eggs match your search"] = "គ្មានពងត្រូវនឹងការស្វែងរក",
     ["No eligible eggs in the loaded map"] = "មិនមានពងនៅលើផែនទីដែលបានផ្ទុក",
-    ["Return after pickup"] = "ត្រឡប់ក្រោយយកពង", ["Stow egg tools at home"] = "ទុកពងនៅក្នុងកាបូប",
+    ["Return to base after pickup"] = "ត្រឡប់ក្រោយយកពង", ["Stow egg tools at home"] = "ទុកពងនៅក្នុងកាបូប",
     ["Anti-AFK"] = "ការពារនៅស្ងៀម", ["Auto leave for owner/admin"] = "ចេញពេលម្ចាស់ចូល",
     ["Refresh map"] = "ផ្ទុកផែនទីឡើងវិញ", ["Clear retry cooldowns"] = "សម្អាតពេលរង់ចាំ",
     ["Clear selected types"] = "សម្អាតប្រភេទដែលជ្រើស", ["Reset session stats"] = "កំណត់ស្ថិតិឡើងវិញ",
-    ["Clear activity"] = "សម្អាតសកម្មភាព", ["Unload VIPKING"] = "បិទ VIPKING",
+    ["Clear activity"] = "សម្អាតសកម្មភាព", ["Unload KAIZE HUB"] = "បិទ KAIZE HUB",
     PICK = "យក", ON = "បើក", OFF = "បិទ", Selected = "បានជ្រើស", All = "ទាំងអស់",
     Priority = "លំដាប់", Nearest = "ជិតបំផុត", ["Auto types"] = "ប្រភេទស្វ័យប្រវត្តិ",
     Speed = "ល្បឿន", Theme = "ពណ៌", ["UI scale"] = "ទំហំ", Language = "ភាសា",
     ["Egg ESP"] = "បង្ហាញពង ESP", ["ESP selected types only"] = "បង្ហាញតែប្រភេទដែលជ្រើស",
-    ["TP to volcano"] = "ទៅភ្នំភ្លើង", ["Save volcano point"] = "រក្សាទីតាំងភ្នំភ្លើង",
-    ["Use auto-detection"] = "ស្វែងរកទីតាំងស្វ័យប្រវត្តិ",
+    Fly = "ហោះ", ["No Clip"] = "ឆ្លងជញ្ជាំង", ["Apply speed"] = "កំណត់ល្បឿន",
 }
 function App:tr(key) return self.language == "km" and Khmer[key] or key end
 function App:colors()
@@ -683,6 +939,12 @@ end
 function App:fit()
     if not self.ui.screen then return end
     local size = self.ui.screen.AbsoluteSize
+    if self.ui.welcomeScale then
+        self.ui.welcomeScale.Scale = math.max(0.25, math.min(1, (size.X - 24) / 380, (size.Y - 24) / 280))
+    end
+    if self.ui.flightPadScale then
+        self.ui.flightPadScale.Scale = math.max(0.25, math.min(1, (size.X - 24) / 244, (size.Y - 24) / 144))
+    end
     local scale = math.max(0.25, math.min(self.uiScale, (size.X - 20) / 448, (size.Y - 20) / 650))
     self.ui.scale.Scale = scale
     local w, h = 448 * scale, (self.minimized and 72 or 650) * scale
@@ -701,16 +963,20 @@ function App:showTab(tab)
     self.dirty = true
 end
 function App:toggleVisible()
+    if self.ui.welcome and self.ui.welcome.Visible then self:openHub(); return end
     self.ui.main.Visible = not self.ui.main.Visible
     self.ui.launcher.Visible = not self.ui.main.Visible
+end
+function App:openHub()
+    if self.ui.welcome then self.ui.welcome.Visible = false end
+    self.ui.main.Visible = true
+    self.ui.launcher.Visible = false
+    self.dirty = true
 end
 function App:toggleAuto()
     if self.auto then self:stop("Auto collection stopped")
     else
-        if self.active and self.active.kind == "volcano" then self:log("Wait for the volcano teleport to finish"); return end
-        for _, job in ipairs(self.queue) do
-            if job.kind == "volcano" then self:log("Wait for the volcano teleport to finish"); return end
-        end
+        self:disableFly()
         self.auto = true
         self:log(self.mode == "Selected" and "Auto started for selected types" or "Auto started for all eligible eggs")
     end
@@ -739,11 +1005,10 @@ function App:buildCollect(page)
             end
             self:log("No available egg to queue")
         end},
-        {"Save home", function() self:saveHome() end},
-        {"Go home", function() self:stop("Returning home"); self:queueJob({kind = "home"}) end},
+        {"Go base", function() self:stop("Returning to assigned base"); self.baseProof = nil; self.baseLastTry = -math.huge; self:queueJob({kind = "home"}) end},
     }
     for i, info in ipairs(actions) do
-        local button = self:button(page, "", UDim2.new(1 / 3, -5, 0, 36), UDim2.new((i - 1) / 3, 0, 0, 124), info[2])
+        local button = self:button(page, "", UDim2.new(0.5, -5, 0, 36), UDim2.new((i - 1) / 2, 0, 0, 124), info[2])
         self:keyText(button, info[1])
     end
     self.ui.search = self:textBox(page, "Search eggs...", UDim2.new(0.65, -6, 0, 36), UDim2.fromOffset(0, 172))
@@ -774,10 +1039,10 @@ function App:updateESP()
         return
     end
     if not self.espGuiFolder or not self.espGuiFolder.Parent then
-        self.espGuiFolder = self:node("Folder", PlayerGui, {Name = "VIPKING_V2_ESP_Labels"})
+        self.espGuiFolder = self:node("Folder", PlayerGui, {Name = "KAIZE_HUB_ESP_Labels"})
     end
     if not self.espWorldFolder or not self.espWorldFolder.Parent then
-        self.espWorldFolder = self:node("Folder", Workspace, {Name = "VIPKING_V2_ESP_Highlights"})
+        self.espWorldFolder = self:node("Folder", Workspace, {Name = "KAIZE_HUB_ESP_Highlights"})
     end
     local list = self:listEggs()
     table.sort(list, function(a, b) return Rules.less(a, b, "Nearest") end)
@@ -846,29 +1111,96 @@ function App:buildWorld(page)
     self.ui.espInfo = self:label(scroll, "", UDim2.new(1, 0, 0, 48), nil, 12, "muted")
     self.ui.espInfo.LayoutOrder = 3; self.ui.espInfo.TextWrapped = true
     self.ui.espInfo.TextTruncate = Enum.TextTruncate.None
-    self.ui.volcanoTP = button("TP to volcano", 4, function()
-        self:stop("Volcano teleport queued; auto farm stopped")
-        self:queueJob({kind = "volcano"})
-    end, true)
-    self.ui.volcanoSave = button("Save volcano point", 5, function() self:saveVolcano() end)
-    self.ui.volcanoAuto = button("Use auto-detection", 6, function()
-        self.volcanoSaved = nil
-        Config.VolcanoCFrame = nil
-        self.volcanoInfo = "Auto-detection selected. Press TP to volcano to scan the loaded map."
-        self:log(self.volcanoInfo)
-    end)
-    self.ui.volcanoInfo = self:label(scroll, "", UDim2.new(1, 0, 0, 74), nil, 12, "muted")
-    self.ui.volcanoInfo.LayoutOrder = 7; self.ui.volcanoInfo.TextWrapped = true
-    self.ui.volcanoInfo.TextTruncate = Enum.TextTruncate.None
-    local note = self:label(scroll, "Auto-detect uses named volcano markers or ground near its edge. If unavailable, visit the volcano once and save your position. Saved points last for this session.",
-        UDim2.new(1, 0, 0, 80), nil, 11, "muted")
-    note.LayoutOrder = 8; note.TextWrapped = true; note.TextTruncate = Enum.TextTruncate.None
+    self:buildMovementControls(scroll)
 end
 function App:renderWorld()
     self.ui.espToggle.Text = self:tr("Egg ESP") .. "  :  " .. self:tr(self.espEnabled and "ON" or "OFF")
     self.ui.espSelected.Text = self:tr("ESP selected types only") .. "  :  " .. self:tr(self.espSelectedOnly and "ON" or "OFF")
     self.ui.espInfo.Text = string.format("ESP labels: %d / %d max. Nearest %d get outlines. Loaded map eggs only.", self.espCount, Config.MaxESP, Config.MaxHighlights)
-    self.ui.volcanoInfo.Text = self.volcanoInfo
+    self:renderMovementControls()
+end
+
+function App:buildMovementControls(scroll)
+    self.ui.flyToggle = self:button(scroll, "Fly", UDim2.new(1, 0, 0, 42), nil, function()
+        if self.flyEnabled then self:disableFly(); self:log("Fly OFF") else self:enableFly() end
+    end, true)
+    self.ui.flyToggle.LayoutOrder = 4
+    local speedRow = self:node("Frame", scroll, {Size = UDim2.new(1, 0, 0, 40), BackgroundTransparency = 1, LayoutOrder = 5})
+    self.ui.flyMinus = self:button(speedRow, "-50", UDim2.fromOffset(48, 40), nil, function() self:setFlySpeed(self.flySpeed - 50) end)
+    self.ui.flySpeedBox = self:textBox(speedRow, "50 - 5000", UDim2.new(1, -186, 0, 40), UDim2.fromOffset(56, 0))
+    self.ui.flySpeedBox.Text = tostring(self.flySpeed)
+    self.ui.flyPlus = self:button(speedRow, "+50", UDim2.fromOffset(48, 40), UDim2.new(1, -122, 0, 0), function() self:setFlySpeed(self.flySpeed + 50) end)
+    self.ui.flyApply = self:button(speedRow, "Apply", UDim2.fromOffset(66, 40), UDim2.new(1, -66, 0, 0), function() self:setFlySpeed(self.ui.flySpeedBox.Text) end)
+    self:connect(self.ui.flySpeedBox.FocusLost, function() self:setFlySpeed(self.ui.flySpeedBox.Text) end)
+    local presets = self:node("Frame", scroll, {Size = UDim2.new(1, 0, 0, 32), BackgroundTransparency = 1, LayoutOrder = 6})
+    for i, speed in ipairs({50, 250, 1000, 5000}) do
+        self:button(presets, tostring(speed), UDim2.new(0.25, -5, 0, 32), UDim2.new((i - 1) / 4, 0, 0, 0), function() self:setFlySpeed(speed) end)
+    end
+    self.ui.noclipToggle = self:button(scroll, "No Clip", UDim2.new(1, 0, 0, 42), nil, function()
+        local wasEnabled = self.noclipEnabled
+        self:setNoclip(not wasEnabled)
+        if wasEnabled then self:log("No Clip OFF; collision restored") end
+    end)
+    self.ui.noclipToggle.LayoutOrder = 7
+    self.ui.flyInfo = self:label(scroll, "", UDim2.new(1, 0, 0, 36), nil, 12, "muted")
+    self.ui.flyInfo.LayoutOrder = 8; self.ui.flyInfo.TextWrapped = true
+    self.ui.flyInfo.TextTruncate = Enum.TextTruncate.None
+    local hint = self:label(scroll,
+        "Fly: W A S D + camera. Space/E = up; Q/LeftCtrl = down. Touch buttons appear while flying.\nFly stops farming. Starting collection turns Fly off. F6/STOP turns off Fly and No Clip.",
+        UDim2.new(1, 0, 0, 90), nil, 11, "muted")
+    hint.LayoutOrder = 9; hint.TextWrapped = true; hint.TextTruncate = Enum.TextTruncate.None
+end
+function App:renderMovementControls()
+    self.ui.flyToggle.Text = self:tr("Fly") .. "  :  " .. self:tr(self.flyEnabled and "ON" or "OFF")
+    self.ui.noclipToggle.Text = self:tr("No Clip") .. "  :  " .. self:tr(self.noclipEnabled and "ON" or "OFF")
+    self.ui.flyInfo.Text = "Fly speed: " .. self.flySpeed .. " studs/s  |  Range: 50 - 5000"
+    if self.ui.flightInfo then self.ui.flightInfo.Text = "FLY  /  " .. self.flySpeed .. " studs/s" end
+end
+function App:buildFlightPad()
+    local pad = self:node("Frame", self.ui.screen, {Name = "FlightControls", Size = UDim2.fromOffset(244, 144),
+        Position = UDim2.new(1, -14, 1, -14), AnchorPoint = Vector2.new(1, 1), BorderSizePixel = 0, Visible = false})
+    self.ui.flightPad = pad
+    self:paint(pad, "BackgroundColor3", "bg"); self:round(pad, 12)
+    self.ui.flightPadScale = self:node("UIScale", pad, {Scale = 1})
+    self.ui.flightInfo = self:label(pad, "FLY", UDim2.new(1, -16, 0, 20), UDim2.fromOffset(8, 4), 11, "accent")
+    self.ui.flyPadOff = self:button(pad, "OFF", UDim2.fromOffset(50, 44), UDim2.fromOffset(8, 30), function()
+        self:disableFly(); self:log("Fly OFF")
+    end)
+    self.ui.flightButtons = {}
+    for _, info in ipairs({{"forward", "W", 66, 30}, {"up", "UP", 182, 30},
+        {"left", "A", 8, 82}, {"back", "S", 66, 82}, {"right", "D", 124, 82}, {"down", "DOWN", 182, 82}}) do
+        local action = info[1]
+        local button = self:button(pad, info[2], UDim2.fromOffset(50, 44), UDim2.fromOffset(info[3], info[4]), nil)
+        button.TextSize = 11
+        self.ui.flightButtons[action] = button
+        self:connect(button.InputBegan, function(input)
+            if self.flyEnabled and (input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1) then
+                self.flightTouches[input] = action
+            end
+        end)
+        self:connect(button.InputEnded, function(input) self.flightTouches[input] = nil end)
+    end
+end
+function App:buildWelcome()
+    local welcome = self:node("Frame", self.ui.screen, {Name = "Welcome", Size = UDim2.fromOffset(380, 280),
+        Position = UDim2.fromScale(0.5, 0.5), AnchorPoint = Vector2.new(0.5, 0.5), BorderSizePixel = 0})
+    self.ui.welcome = welcome
+    self:paint(welcome, "BackgroundColor3", "bg"); self:round(welcome, 18)
+    local border = self:node("UIStroke", welcome, {Thickness = 1})
+    self:paint(border, "Color", "accent")
+    self.ui.welcomeScale = self:node("UIScale", welcome, {Scale = 1})
+    local store = self:label(welcome, "KAIZE STORE", UDim2.new(1, -32, 0, 20), UDim2.fromOffset(16, 22), 12, "accent")
+    store.TextXAlignment = Enum.TextXAlignment.Center
+    local title = self:label(welcome, "KAIZE HUB", UDim2.new(1, -32, 0, 40), UDim2.fromOffset(16, 51), 29)
+    title.Font = Enum.Font.GothamBold; title.TextXAlignment = Enum.TextXAlignment.Center
+    local greeting = self:label(welcome, "Welcome to my script — Kaize Store", UDim2.new(1, -48, 0, 50), UDim2.fromOffset(24, 99), 14, "muted")
+    greeting.TextXAlignment = Enum.TextXAlignment.Center
+    greeting.TextWrapped = true; greeting.TextTruncate = Enum.TextTruncate.None
+    self.ui.welcomeGreeting = greeting
+    self.ui.openHub = self:button(welcome, "OPEN KAIZE HUB", UDim2.new(1, -40, 0, 46), UDim2.fromOffset(20, 165), function() self:openHub() end, true)
+    self.ui.closeWelcome = self:button(welcome, "Close script", UDim2.new(1, -40, 0, 32), UDim2.fromOffset(20, 224), function() self:unload() end)
+    self.ui.main.Visible = false
+    self.ui.launcher.Visible = false
 end
 
 function App:buildSettings(page)
@@ -887,7 +1219,7 @@ function App:buildSettings(page)
     end
     setting("Auto types", function() cycle("mode", {"All", "Selected"}) end, function() return self:tr(self.mode) end)
     setting("Speed", function() cycle("speed", {"Balanced", "Fast", "Reliable"}) end, function() return self.speed end)
-    for _, entry in ipairs({{"Return after pickup", "autoReturn"}, {"Stow egg tools at home", "stowEggTools"}, {"Anti-AFK", "antiAFK"}}) do
+    for _, entry in ipairs({{"Return to base after pickup", "autoReturn"}, {"Stow egg tools at home", "stowEggTools"}, {"Anti-AFK", "antiAFK"}}) do
         local title, field = entry[1], entry[2]
         setting(title, function() self[field] = not self[field] end, function() return self:tr(self[field] and "ON" or "OFF") end)
     end
@@ -906,14 +1238,14 @@ function App:buildSettings(page)
     setting("Clear retry cooldowns", function() self.cooldown = setmetatable({}, {__mode = "k"}); self:log("Retry cooldowns cleared") end)
     setting("Clear selected types", function() self.selected = {}; self:log("Selected types cleared") end)
     setting("Reset session stats", function() self.picked = 0; self.unverified = 0; self.failures = 0; self.started = os.clock() end)
-    setting("Unload VIPKING", function() self:unload() end)
+    setting("Unload KAIZE HUB", function() self:unload() end)
     local note = self:label(scroll, "RightControl: show/hide  |  F6: stop\nSEL marks egg types for Selected mode.\nFast uses an optional prompt helper; Reliable uses the normal prompt hold. Settings last for this session.",
         UDim2.new(1, 0, 0, 90), nil, 11, "muted")
     note.LayoutOrder = order + 1; note.TextWrapped = true; note.TextTruncate = Enum.TextTruncate.None
 end
 
 function App:buildUI()
-    self.gui = self:node("ScreenGui", PlayerGui, {Name = "VIPKING_V2", ResetOnSpawn = false,
+    self.gui = self:node("ScreenGui", PlayerGui, {Name = "KAIZE_HUB_V3", ResetOnSpawn = false,
         IgnoreGuiInset = false, ZIndexBehavior = Enum.ZIndexBehavior.Sibling, DisplayOrder = 50})
     local shutdown = self:node("BindableFunction", self.gui, {Name = "Shutdown"})
     shutdown.OnInvoke = function() self:unload() end
@@ -925,8 +1257,8 @@ function App:buildUI()
     self:paint(stroke, "Color", "border")
     self.ui.scale = self:node("UIScale", self.ui.main, {Scale = 1})
     local header = self:node("Frame", self.ui.main, {Size = UDim2.new(1, 0, 0, 72), BackgroundTransparency = 1, Active = true})
-    self:label(header, "VIPKING", UDim2.fromOffset(196, 26), UDim2.fromOffset(18, 12), 22).Font = Enum.Font.GothamBold
-    self:label(header, "RIDE A PET  /  2.1", UDim2.fromOffset(200, 16), UDim2.fromOffset(19, 40), 10, "muted")
+    self:label(header, "KAIZE HUB", UDim2.fromOffset(196, 26), UDim2.fromOffset(18, 12), 22).Font = Enum.Font.GothamBold
+    self:label(header, "KAIZE STORE  /  RIDE A PET  /  3.1", UDim2.fromOffset(200, 16), UDim2.fromOffset(19, 40), 10, "muted")
     local stop = self:button(header, "STOP", UDim2.fromOffset(54, 32), UDim2.new(1, -140, 0, 18), function() self:stop("Emergency stop") end)
     self:paint(stop, "TextColor3", "danger")
     self.ui.minimize = self:button(header, "-", UDim2.fromOffset(30, 32), UDim2.new(1, -78, 0, 18), function()
@@ -937,8 +1269,8 @@ function App:buildUI()
         self:fit()
     end)
     self:button(header, "X", UDim2.fromOffset(30, 32), UDim2.new(1, -40, 0, 18), function() self:unload() end)
-    self.ui.launcher = self:button(self.ui.screen, "VIP", UDim2.fromOffset(50, 44), UDim2.new(0, 12, 0.5, -22), function() self:toggleVisible() end, true)
-    self.ui.launcher.Visible = false
+    self.ui.launcher = self:button(self.ui.screen, "KAIZE", UDim2.fromOffset(76, 44), UDim2.new(0, 12, 0.5, -22), function() self:toggleVisible() end, true)
+    self.ui.launcher.Visible = true
     self.ui.content = self:node("Frame", self.ui.main, {Size = UDim2.new(1, 0, 1, -72), Position = UDim2.fromOffset(0, 72), BackgroundTransparency = 1})
     self.ui.tabs, self.ui.pages = {}, {}
     for i, name in ipairs({"Collect", "World", "Settings", "Activity"}) do
@@ -951,11 +1283,11 @@ function App:buildUI()
     self:buildWorld(self.ui.pages.World)
     self:buildSettings(self.ui.pages.Settings)
     local activity = self.ui.pages.Activity
-    self.ui.diagnostics = self:label(activity, "", UDim2.new(1, 0, 0, 42), nil, 11, "muted")
+    self.ui.diagnostics = self:label(activity, "", UDim2.new(1, 0, 0, 76), nil, 11, "muted")
     self.ui.diagnostics.TextWrapped = true; self.ui.diagnostics.TextTruncate = Enum.TextTruncate.None
-    local clear = self:button(activity, "", UDim2.new(1, 0, 0, 34), UDim2.fromOffset(0, 50), function() self.logs = {} end)
+    local clear = self:button(activity, "", UDim2.new(1, 0, 0, 34), UDim2.fromOffset(0, 84), function() self.logs = {} end)
     self:keyText(clear, "Clear activity")
-    local logScroll = self:scroll(activity, UDim2.new(1, 0, 1, -96), UDim2.fromOffset(0, 96))
+    local logScroll = self:scroll(activity, UDim2.new(1, 0, 1, -130), UDim2.fromOffset(0, 130))
     self.ui.logText = self:label(logScroll, "", UDim2.new(1, -4, 0, 0), nil, 12, "muted")
     self.ui.logText.AutomaticSize = Enum.AutomaticSize.Y
     self.ui.logText.TextWrapped = true; self.ui.logText.TextTruncate = Enum.TextTruncate.None
@@ -981,13 +1313,21 @@ function App:buildUI()
     end)
     self:connect(UserInputService.InputEnded, function(input)
         if drag and input == drag.input then drag = nil end
+        self.flightKeys[input.KeyCode] = nil
+        self.flightTouches[input] = nil
     end)
-    self:connect(UserInputService.WindowFocusReleased, function() drag = nil end)
+    self:connect(UserInputService.WindowFocusReleased, function()
+        drag = nil; self.windowFocused = false; self:clearFlightInput()
+    end)
+    self:connect(UserInputService.WindowFocused, function() self.windowFocused = true end)
     self:connect(UserInputService.InputBegan, function(input, processed)
         if processed or UserInputService:GetFocusedTextBox() then return end
         if input.KeyCode == Enum.KeyCode.RightControl then self:toggleVisible()
         elseif input.KeyCode == Enum.KeyCode.F6 then self:stop("Emergency stop") end
+        if self.flyEnabled and FlyKeyActions[input.KeyCode] then self.flightKeys[input.KeyCode] = FlyKeyActions[input.KeyCode] end
     end)
+    self:buildFlightPad()
+    self:buildWelcome()
     self:showTab(self.tab)
     self:fit()
 end
@@ -1059,8 +1399,8 @@ function App:render()
             entry.button.Text = self:tr(entry.title) .. (entry.value and ("  :  " .. entry.value()) or "")
         end
     elseif self.tab == "Activity" then
-        self.ui.diagnostics.Text = string.format("Prompt helper: %s  |  Scan: %ds\nUnverified: %d  |  Failed jobs: %d",
-            Compat.firePrompt and "available" or "normal hold only", Config.ScanInterval, self.unverified, self.failures)
+        self.ui.diagnostics.Text = string.format("Prompt helper: %s  |  Scan: %ds\nUnverified: %d  |  Failed jobs: %d\n%s",
+            Compat.firePrompt and "available" or "normal hold only", Config.ScanInterval, self.unverified, self.failures, self.baseStatus)
         self.ui.logText.Text = table.concat(self.logs, "\n\n")
     end
 end
@@ -1076,13 +1416,16 @@ function App:checkAdmin(player)
         end
         if self.alive and self.autoLeave and admin and player.Parent == Players then
             self:stop("Auto leave: @" .. player.Name)
-            LocalPlayer:Kick("VIPKING: owner/admin detected (@" .. player.Name .. ")")
+            LocalPlayer:Kick("KAIZE HUB: owner/admin detected (@" .. player.Name .. ")")
         end
     end)
 end
 
 App:buildUI()
 App:connect(Workspace.DescendantAdded, function(obj) App:track(obj) end)
+App:connect(PlayerGui.DescendantAdded, function(obj)
+    if obj:IsA("TextLabel") and not obj:IsDescendantOf(App.gui) then App.baseLabels[obj] = true end
+end)
 App:connect(Workspace.DescendantRemoving, function(obj)
     if App.candidates[obj] then
         -- Defer: Roblox fires DescendantRemoving before Parent changes.
@@ -1092,10 +1435,22 @@ App:connect(Workspace.DescendantRemoving, function(obj)
     end
 end)
 App:connect(LocalPlayer.CharacterAdded, function()
+    App:disableFly(); App:setNoclip(false)
     App:cancel("Respawn detected; waiting for your character")
-    App.home, App.homeCharacter = nil, nil
+    App.baseProof = nil; App.baseLastTry = -math.huge
 end)
-App:connect(LocalPlayer.CharacterRemoving, function() App:cancel("Character removed; actions cancelled") end)
+App:connect(LocalPlayer.CharacterRemoving, function()
+    App:disableFly(); App:setNoclip(false)
+    App:cancel("Character removed; actions cancelled")
+end)
+App:connect(RunService.PreSimulation, function()
+    if not App.flyEnabled and not App.noclipEnabled then return end
+    local ok, err = pcall(function() App:updateMovement() end)
+    if not ok then
+        App:disableFly(); App:setNoclip(false)
+        App:log("Movement stopped: " .. tostring(err))
+    end
+end)
 App:connect(Players.PlayerAdded, function(player) App.dirty = true; App:checkAdmin(player) end)
 App:connect(Players.PlayerRemoving, function(player)
     App.dirty = true
@@ -1110,16 +1465,15 @@ App:connect(LocalPlayer.Idled, function()
     if not ok then App.antiAFK = false; App:log("Anti-AFK is unavailable in this client") end
 end)
 App:scan()
-App:log("Ready. Save your return point, then select PICK or START AUTO.")
+App:log("Ready. Returns use your assigned base only; no positions are saved.")
 App:render()
 
--- One movement worker owns pickup, return, and volcano teleport actions.
+-- One movement worker owns pickup and return actions. Manual flight stops farming before taking control.
 task.spawn(function()
     while App.alive do
         local ok, err = pcall(function()
             local char, root, humanoid = App:character()
             if root then
-                if not App.home then App.home, App.homeCharacter = root.CFrame, char end
                 if root.Anchored or humanoid.Sit then
                     if App.auto or #App.queue > 0 then App.status = "Paused: stand up and wait until your character can move" end
                 else
@@ -1145,7 +1499,7 @@ task.spawn(function()
             end
         end)
         if not ok and App.alive then
-            warn("VIPKING UI: " .. tostring(err))
+            warn("KAIZE HUB UI: " .. tostring(err))
             App:unload() -- do not keep a hidden collection worker running after UI failure
         end
         if App.alive and now - lastESP >= 0.5 then
